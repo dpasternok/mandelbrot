@@ -4,20 +4,179 @@
 #include <GL/glew.h>
 #include <SDL2/SDL_opengl.h>
 #include <math.h>
+#include <pthread.h>
 
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
 #define INITIAL_MAX_ITER 100
 
+// High precision support for deep zoom
+// When scale falls below this threshold, switch to CPU long double rendering
+#define PRECISION_THRESHOLD 1e-14
+
+// Thread data structure for CPU fallback rendering
+typedef struct {
+    int start_row;
+    int end_row;
+    int width;
+    int height;
+    double cx;
+    double cy;
+    double scale;
+    int max_iter;
+    Uint32 *pixels;
+} thread_data_t;
+
+// Convert iteration to RGB color (CPU version)
+static inline Uint32 iter_to_color_cpu(int iter, int max_iter) {
+    if (iter == max_iter) {
+        return 0xFF000000;  // Black
+    }
+
+    double t = (double)iter / max_iter;
+
+    int r = (int)(9 * (1-t) * t*t*t * 255);
+    int g = (int)(15 * (1-t)*(1-t) * t*t * 255);
+    int b = (int)(8.5 * (1-t)*(1-t)*(1-t) * t * 255);
+
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+// Quick check for main cardioid and bulb (CPU version)
+static inline int in_main_set_cpu(double x0, double y0) {
+    // Check main cardioid
+    double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+    if (q * (q + (x0 - 0.25)) < 0.25 * y0 * y0) return 1;
+
+    // Check period-2 bulb
+    if ((x0 + 1.0) * (x0 + 1.0) + y0 * y0 < 0.0625) return 1;
+
+    return 0;
+}
+
+// High precision CPU rendering using long double (for extreme zoom)
+static void render_high_precision(thread_data_t *data) {
+    long double cx = (long double)data->cx;
+    long double cy = (long double)data->cy;
+    long double scale = (long double)data->scale;
+
+    long double aspect = (long double)data->height / data->width;
+    long double x_min = cx - scale / 2;
+    long double x_max = cx + scale / 2;
+    long double y_min = cy - (scale * aspect) / 2;
+    long double y_max = cy + (scale * aspect) / 2;
+
+    long double dx = (x_max - x_min) / data->width;
+    long double dy = (y_max - y_min) / data->height;
+
+    for (int y = data->start_row; y < data->end_row; y++) {
+        long double y0 = y_min + dy * y;
+
+        for (int x = 0; x < data->width; x++) {
+            long double x0 = x_min + dx * x;
+
+            int iter;
+
+            // Quick check for main cardioid and bulb
+            if (in_main_set_cpu((double)x0, (double)y0)) {
+                iter = data->max_iter;
+            } else {
+                long double zx = 0, zy = 0;
+                long double zx2 = 0, zy2 = 0;
+                iter = 0;
+
+                // Period checking
+                long double check_zx = 0, check_zy = 0;
+                int check_iter = 0;
+                int period = 0;
+
+                while (zx2 + zy2 <= 4 && iter < data->max_iter) {
+                    zy = 2 * zx * zy + y0;
+                    zx = zx2 - zy2 + x0;
+                    zx2 = zx * zx;
+                    zy2 = zy * zy;
+                    iter++;
+
+                    // Check for cycle
+                    if (zx == check_zx && zy == check_zy) {
+                        iter = data->max_iter;
+                        break;
+                    }
+
+                    period++;
+                    if (period >= check_iter) {
+                        check_zx = zx;
+                        check_zy = zy;
+                        check_iter = period;
+                        period = 0;
+                    }
+                }
+            }
+
+            data->pixels[y * data->width + x] = iter_to_color_cpu(iter, data->max_iter);
+        }
+    }
+}
+
+// Thread function for CPU rendering
+static void *render_thread_cpu(void *arg) {
+    thread_data_t *data = (thread_data_t *)arg;
+    render_high_precision(data);
+    return NULL;
+}
+
+// CPU fallback rendering when high precision is needed
+static void render_mandelbrot_cpu(Uint32 *pixels, int width, int height,
+                                   double cx, double cy, double scale, int max_iter) {
+    int num_threads = SDL_GetCPUCount();
+    if (num_threads < 1) num_threads = 4;
+    if (num_threads > height) num_threads = height;
+
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_data_t *thread_data = malloc(num_threads * sizeof(thread_data_t));
+
+    int rows_per_thread = height / num_threads;
+    int extra_rows = height % num_threads;
+    int current_row = 0;
+
+    // Start threads
+    for (int t = 0; t < num_threads; t++) {
+        int thread_rows = rows_per_thread + (t < extra_rows ? 1 : 0);
+
+        thread_data[t].start_row = current_row;
+        thread_data[t].end_row = current_row + thread_rows;
+        thread_data[t].width = width;
+        thread_data[t].height = height;
+        thread_data[t].cx = cx;
+        thread_data[t].cy = cy;
+        thread_data[t].scale = scale;
+        thread_data[t].max_iter = max_iter;
+        thread_data[t].pixels = pixels;
+
+        pthread_create(&threads[t], NULL, render_thread_cpu, &thread_data[t]);
+
+        current_row += thread_rows;
+    }
+
+    // Wait for completion
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    free(threads);
+    free(thread_data);
+}
+
 // Compute shader source code
 const char *compute_shader_source = R"(
 #version 430 core
+#extension GL_ARB_gpu_shader_fp64 : enable
 
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(rgba8, binding = 0) uniform image2D img_output;
 
-uniform vec2 center;
-uniform float scale;
+uniform dvec2 center;
+uniform double scale;
 uniform int max_iter;
 uniform int width;
 uniform int height;
@@ -37,9 +196,9 @@ vec3 iter_to_color(int iter, int max_iter) {
 }
 
 // Quick check for main cardioid and bulb
-bool in_main_set(float x0, float y0) {
+bool in_main_set(double x0, double y0) {
     // Check main cardioid
-    float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+    double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
     if (q * (q + (x0 - 0.25)) < 0.25 * y0 * y0) return true;
 
     // Check period-2 bulb
@@ -55,29 +214,29 @@ void main() {
         return;
     }
 
-    float aspect = float(height) / float(width);
-    float x_min = center.x - scale / 2.0;
-    float x_max = center.x + scale / 2.0;
-    float y_min = center.y - (scale * aspect) / 2.0;
-    float y_max = center.y + (scale * aspect) / 2.0;
+    double aspect = double(height) / double(width);
+    double x_min = center.x - scale / 2.0;
+    double x_max = center.x + scale / 2.0;
+    double y_min = center.y - (scale * aspect) / 2.0;
+    double y_max = center.y + (scale * aspect) / 2.0;
 
-    float x0 = x_min + (x_max - x_min) * float(pixel_coords.x) / float(width);
-    float y0 = y_min + (y_max - y_min) * float(pixel_coords.y) / float(height);
+    double x0 = x_min + (x_max - x_min) * double(pixel_coords.x) / double(width);
+    double y0 = y_min + (y_max - y_min) * double(pixel_coords.y) / double(height);
 
     int iter;
 
     if (in_main_set(x0, y0)) {
         iter = max_iter;
     } else {
-        float zx = 0.0;
-        float zy = 0.0;
-        float zx2 = 0.0;
-        float zy2 = 0.0;
+        double zx = 0.0;
+        double zy = 0.0;
+        double zx2 = 0.0;
+        double zy2 = 0.0;
         iter = 0;
 
         // Period checking
-        float check_zx = 0.0;
-        float check_zy = 0.0;
+        double check_zx = 0.0;
+        double check_zy = 0.0;
         int check_iter = 0;
         int period = 0;
 
@@ -389,6 +548,9 @@ int main(void) {
     int width = WINDOW_WIDTH;
     int height = WINDOW_HEIGHT;
 
+    // CPU fallback pixel buffer (for high precision mode)
+    Uint32 *cpu_pixels = malloc(width * height * sizeof(Uint32));
+
     // Animation variables
     double target_scale = scale;
     double target_cx = cx;
@@ -605,6 +767,10 @@ int main(void) {
                         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
+                        // Reallocate CPU pixel buffer
+                        free(cpu_pixels);
+                        cpu_pixels = malloc(width * height * sizeof(Uint32));
+
                         needs_redraw = 1;
                     }
                     break;
@@ -643,16 +809,50 @@ int main(void) {
 
         // Render if needed
         if (needs_redraw) {
-            // Dispatch compute shader
-            glUseProgram(compute_program);
-            glUniform2f(glGetUniformLocation(compute_program, "center"), (float)cx, (float)cy);
-            glUniform1f(glGetUniformLocation(compute_program, "scale"), (float)scale);
-            glUniform1i(glGetUniformLocation(compute_program, "max_iter"), max_iter);
-            glUniform1i(glGetUniformLocation(compute_program, "width"), width);
-            glUniform1i(glGetUniformLocation(compute_program, "height"), height);
+            // Detect if we need high precision rendering
+            static int use_high_precision = 0;
+            static int precision_notified = 0;
+            int new_precision_mode = (scale < PRECISION_THRESHOLD);
 
-            glDispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            if (new_precision_mode != use_high_precision) {
+                use_high_precision = new_precision_mode;
+
+                if (use_high_precision && !precision_notified) {
+                    printf("\n=== HIGH PRECISION MODE ===\n");
+                    printf("Scale %.2e < %.2e threshold\n", scale, PRECISION_THRESHOLD);
+                    printf("Switching to CPU long double (80-bit) precision\n");
+                    printf("GPU compute disabled, using CPU multithreaded rendering\n");
+                    printf("Note: ~1000x deeper zoom available\n");
+                    printf("===========================\n\n");
+                    precision_notified = 1;
+                } else if (!use_high_precision && precision_notified) {
+                    printf("\n=== NORMAL PRECISION MODE ===\n");
+                    printf("GPU compute shader enabled\n");
+                    printf("==============================\n\n");
+                    precision_notified = 0;
+                }
+            }
+
+            if (use_high_precision) {
+                // CPU fallback rendering with long double precision
+                render_mandelbrot_cpu(cpu_pixels, width, height, cx, cy, scale, max_iter);
+
+                // Upload CPU-rendered pixels to GPU texture
+                glBindTexture(GL_TEXTURE_2D, texture);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                               GL_RGBA, GL_UNSIGNED_BYTE, cpu_pixels);
+            } else {
+                // GPU compute shader rendering
+                glUseProgram(compute_program);
+                glUniform2d(glGetUniformLocation(compute_program, "center"), cx, cy);
+                glUniform1d(glGetUniformLocation(compute_program, "scale"), scale);
+                glUniform1i(glGetUniformLocation(compute_program, "max_iter"), max_iter);
+                glUniform1i(glGetUniformLocation(compute_program, "width"), width);
+                glUniform1i(glGetUniformLocation(compute_program, "height"), height);
+
+                glDispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            }
 
             // Render texture to screen
             glClear(GL_COLOR_BUFFER_BIT);
@@ -681,6 +881,7 @@ int main(void) {
     }
 
     // Cleanup
+    free(cpu_pixels);
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
     glDeleteTextures(1, &texture);

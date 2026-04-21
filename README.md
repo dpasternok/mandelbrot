@@ -25,7 +25,7 @@ The Mandelbrot set is defined as the set of complex numbers $c$ for which the it
 
 $$z_{n+1} = z_n^2 + c$$
 
-starting from $z_0 = 0$, remains bounded ($|z| \leq 2$).
+starting from $z_{0} = 0$, remains bounded ($|z| \leq 2$).
 
 ## Version Comparison
 
@@ -45,6 +45,8 @@ graph LR
 | **Multi-threading** | No | Yes | Yes | N/A (GPU) |
 | **SIMD Optimization** | No | No | AVX-512/AVX2 | N/A (GPU) |
 | **GPU Acceleration** | No | No | No | Yes (OpenGL) |
+| **High Precision Mode** | No | No | Yes (auto) | Yes (auto) |
+| **Max Zoom Depth** | 10^14 | 10^14 | 10^17 | 10^17 |
 | **Smooth Animations** | No | Yes | Yes | Yes |
 | **Mouse Support** | No | No | Yes | Yes |
 | **Auto Quality Scaling** | No | No | Yes | Yes |
@@ -149,6 +151,9 @@ High-performance CPU version using SIMD instructions and SDL2.
 - **AVX-512 SIMD**: Processes 8 pixels simultaneously
   - Falls back to AVX2 (4 pixels) if AVX-512 unavailable
 - **Multi-threading**: Work distributed across CPU cores
+- **High precision mode**: Automatic switch to long double (80-bit) for extreme zoom
+  - Enables 1000x deeper zoom beyond double precision limit
+  - Falls back to scalar rendering when SIMD not applicable
 - **SDL2 Graphics**: Hardware-accelerated display
 - **Mouse controls**: Zoom at cursor, drag to pan
 - **Smooth animations**: 60 FPS interpolated movement
@@ -215,10 +220,13 @@ graph TD
 Maximum performance version using OpenGL compute shaders.
 
 **Features:**
-- **GPU compute shaders**: Massively parallel rendering
-- **OpenGL 4.3+**: Modern graphics API
+- **GPU compute shaders**: Massively parallel rendering with double precision (64-bit)
+- **OpenGL 4.3+**: Modern graphics API with FP64 extension support
 - **Per-pixel parallelism**: Every pixel computed independently
 - **Hardware acceleration**: Full GPU utilization
+- **High precision mode**: Automatic CPU fallback with long double (80-bit) for extreme zoom
+  - Enables 1000x deeper zoom beyond GPU double precision limit
+  - Falls back to multithreaded CPU rendering when GPU precision insufficient
 - **All optimizations in shader**: Cardioid, period detection on GPU
 
 **Architecture:**
@@ -247,8 +255,8 @@ CPU Side:
   3. Memory barrier
   4. Render fullscreen quad with texture
 
-GPU Side (per pixel):
-  1. Calculate complex plane coordinates
+GPU Side (per pixel, double precision):
+  1. Calculate complex plane coordinates (64-bit doubles)
   2. Check cardioid/bulb (early exit)
   3. Mandelbrot iteration loop with period detection
   4. Color calculation
@@ -268,6 +276,7 @@ GPU Side (per pixel):
 - OpenGL 4.3+ capable GPU
 - GLEW library
 - Compute shader support
+- GL_ARB_gpu_shader_fp64 extension (double precision support)
 
 **Performance:**
 - 20-50x faster than CPU on integrated GPUs (Intel Iris Xe)
@@ -603,9 +612,9 @@ All threads execute in parallel across GPU execution units.
 
 Automatically adjust quality based on zoom level:
 
-$$\text{max\_iter} = \text{base\_iter} + k \cdot \ln\left(\frac{\text{initial\_scale}}{\text{current\_scale}}\right)$$
+$$\mathrm{max\_iter} = \mathrm{base\_iter} + k \cdot \ln\left(\frac{\mathrm{initial\_scale}}{\mathrm{current\_scale}}\right)$$
 
-where $\text{base\_iter} = 100$ and $k = 50$.
+where $\mathrm{base\_iter} = 100$ and $k = 50$.
 
 **Examples:**
 - $\text{scale} = 3.0$ (initial) -> 100 iterations
@@ -682,19 +691,19 @@ The complex plane is mapped to screen coordinates:
 
 **Screen mapping:**
 
-$$\text{real} = \text{center}_x + \frac{(\text{pixel}_x - \text{width}/2) \cdot \text{scale}}{\text{width}}$$
+$$\mathrm{real} = \mathrm{center\_x} + \frac{(\mathrm{pixel\_x} - \mathrm{width}/2) \cdot \mathrm{scale}}{\mathrm{width}}$$
 
-$$\text{imag} = \text{center}_y + \frac{(\text{pixel}_y - \text{height}/2) \cdot \text{scale} \cdot \text{aspect}}{\text{width}}$$
+$$\mathrm{imag} = \mathrm{center\_y} + \frac{(\mathrm{pixel\_y} - \mathrm{height}/2) \cdot \mathrm{scale} \cdot \mathrm{aspect}}{\mathrm{width}}$$
 
-where $\text{aspect} = \frac{\text{height}}{\text{width}}$.
+where $\mathrm{aspect} = \frac{\mathrm{height}}{\mathrm{width}}$.
 
 ### Color Algorithm
 
 Smooth color mapping using normalized iteration count:
 
-If $\text{iter} = \text{max\_iter}$, return BLACK.
+If $\mathrm{iter} = \mathrm{max\_iter}$, return BLACK.
 
-Otherwise, let $t = \frac{\text{iter}}{\text{max\_iter}}$. Then:
+Otherwise, let $t = \frac{\mathrm{iter}}{\mathrm{max\_iter}}$. Then:
 
 $$r = 9(1-t)t^3 \cdot 255$$
 $$g = 15(1-t)^2 t^2 \cdot 255$$
@@ -722,14 +731,63 @@ Per-frame memory requirements:
 
 ### Floating Point Precision
 
-All versions use `double` precision (64-bit IEEE 754):
+**Normal Precision Mode:**
+
+All versions use `double` precision (64-bit IEEE 754) by default:
 - Approximately 15 decimal digits of precision
 - Sufficient for zoom levels up to $\sim 10^{14}$
-- Beyond this, multi-precision arithmetic required (not implemented)
+- Enables SIMD vectorization (AVX-512/AVX2) in mandel3
+- Enables GPU compute shaders in mandel4
+
+**High Precision Mode (mandel3 & mandel4):**
+
+When scale falls below $10^{-14}$, mandel3 and mandel4 automatically switch to `long double` precision (80-bit x87):
+- Approximately 18-19 decimal digits of precision
+- Enables zoom levels up to $\sim 10^{17}$ (1000x deeper)
+- Falls back to CPU scalar rendering (SIMD disabled in mandel3, GPU disabled in mandel4)
+- Uses multi-threaded CPU rendering for acceptable performance
+
+**Mode Switching:**
+
+The programs automatically detect when high precision is needed and print a notification:
+
+```
+=== HIGH PRECISION MODE ===
+Scale 9.99e-15 < 1.00e-14 threshold
+Switching to long double (80-bit) precision
+SIMD/GPU disabled, using CPU multithreaded rendering
+Note: ~1000x deeper zoom available
+===========================
+```
+
+When zooming back out above the threshold, the programs switch back to normal precision mode:
+
+```
+=== NORMAL PRECISION MODE ===
+SIMD enabled (AVX-512/AVX2)  [mandel3]
+GPU compute shader enabled   [mandel4]
+==============================
+```
+
+**Performance Impact:**
+
+High precision mode is slower than normal mode due to:
+1. No SIMD vectorization (long double not supported by AVX-512/AVX2)
+2. No GPU acceleration (long double not supported by OpenGL compute shaders)
+3. More expensive arithmetic operations (80-bit vs 64-bit)
+
+Expected performance in high precision mode:
+- mandel3: ~5-10x slower than normal SIMD mode (still uses multithreading)
+- mandel4: ~10-20x slower than GPU mode (falls back to CPU, but multithreaded)
+
+However, high precision mode still outperforms single-threaded scalar code, and is the only way to explore extremely deep zoom levels beyond the double precision limit.
 
 ### Known Limitations
 
-1. **Maximum zoom depth:** $\sim 10^{14}$ before floating point precision loss
+1. **Maximum zoom depth:** 
+   - mandel, mandel2: $\sim 10^{14}$ (double precision limit)
+   - mandel3, mandel4: $\sim 10^{17}$ (long double extended precision)
+   - Beyond $10^{17}$, arbitrary precision arithmetic required (not implemented)
 2. **Integer iteration overflow:** max_iter capped at 2000 to prevent overflow
 3. **No Julia set mode:** Only Mandelbrot set implemented
 4. **No image export:** Real-time rendering only, no save functionality
@@ -745,6 +803,7 @@ All versions use `double` precision (64-bit IEEE 754):
 1. GPU doesn't support OpenGL 4.3+
 2. Compute shaders not available
 3. GLEW initialization failed
+4. GPU doesn't support GL_ARB_gpu_shader_fp64 extension
 
 **Solutions:**
 ```bash
@@ -752,12 +811,27 @@ All versions use `double` precision (64-bit IEEE 754):
 glxinfo | grep "OpenGL version"
 # Should show: OpenGL version 4.3 or higher
 
+# Check for FP64 support
+glxinfo | grep "GL_ARB_gpu_shader_fp64"
+# Should appear in the extension list
+
 # Update graphics drivers
 sudo ubuntu-drivers autoinstall
 
 # Fall back to CPU version
 ./mandel3
 ```
+
+### mandel4 shows artifacts or blurring at high iterations
+
+**Cause:** GPU shader uses double precision (64-bit), which has limits at very high iteration counts (1000+) or extreme zoom.
+
+**Solution:** The program should automatically switch to high precision CPU mode when scale < 10^-14. If artifacts appear before that threshold, you can:
+- Use mandel3 instead (CPU SIMD version)
+- Reduce iteration count with `[` key
+- The double precision limit is ~10^14 for scale values
+
+**Note:** This issue was resolved in the current version by switching GPU shader from float to double precision. If you still see artifacts at 700+ iterations, ensure you're running the latest version.
 
 ### Compilation error: "AVX-512 not supported"
 
@@ -836,7 +910,7 @@ mandelbrot/
 
 ## License
 
-This project is provided as-is for educational purposes. It is released under the GPL 3.0 license and presents a practical demonstration of no‑code software development using Claude Code.
+This project is provided as-is for educational purposes. It is released under the GPL 3.0 license and presents a practical demonstration of no‑code software development using various LLM models.
 
 ---
 
