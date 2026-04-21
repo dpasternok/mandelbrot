@@ -16,6 +16,10 @@
 #define WINDOW_HEIGHT 720
 #define INITIAL_MAX_ITER 100
 
+// High precision support for deep zoom
+// When scale falls below this threshold, switch to long double scalar rendering
+#define PRECISION_THRESHOLD 1e-14
+
 // Thread data structure
 typedef struct {
     int start_row;
@@ -27,6 +31,7 @@ typedef struct {
     double scale;
     int max_iter;
     Uint32 *pixels;
+    int use_high_precision;  // Flag to use long double rendering
 } thread_data_t;
 
 // Convert iteration to RGB color
@@ -188,9 +193,79 @@ static inline void compute_4_pixels_avx2(double x0, double dx, double y0,
 }
 #endif
 
+// High precision rendering using long double (for extreme zoom)
+static void render_high_precision(thread_data_t *data) {
+    long double cx = (long double)data->cx;
+    long double cy = (long double)data->cy;
+    long double scale = (long double)data->scale;
+
+    long double aspect = (long double)data->height / data->width;
+    long double x_min = cx - scale / 2;
+    long double x_max = cx + scale / 2;
+    long double y_min = cy - (scale * aspect) / 2;
+    long double y_max = cy + (scale * aspect) / 2;
+
+    long double dx = (x_max - x_min) / data->width;
+    long double dy = (y_max - y_min) / data->height;
+
+    for (int y = data->start_row; y < data->end_row; y++) {
+        long double y0 = y_min + dy * y;
+
+        for (int x = 0; x < data->width; x++) {
+            long double x0 = x_min + dx * x;
+
+            int iter;
+
+            // Quick check for main cardioid and bulb
+            if (in_main_set((double)x0, (double)y0)) {
+                iter = data->max_iter;
+            } else {
+                long double zx = 0, zy = 0;
+                long double zx2 = 0, zy2 = 0;
+                iter = 0;
+
+                // Period checking
+                long double check_zx = 0, check_zy = 0;
+                int check_iter = 0;
+                int period = 0;
+
+                while (zx2 + zy2 <= 4 && iter < data->max_iter) {
+                    zy = 2 * zx * zy + y0;
+                    zx = zx2 - zy2 + x0;
+                    zx2 = zx * zx;
+                    zy2 = zy * zy;
+                    iter++;
+
+                    // Check for cycle
+                    if (zx == check_zx && zy == check_zy) {
+                        iter = data->max_iter;
+                        break;
+                    }
+
+                    period++;
+                    if (period >= check_iter) {
+                        check_zx = zx;
+                        check_zy = zy;
+                        check_iter = period;
+                        period = 0;
+                    }
+                }
+            }
+
+            data->pixels[y * data->width + x] = iter_to_color(iter, data->max_iter);
+        }
+    }
+}
+
 // Thread function rendering a fragment
 static void *render_thread(void *arg) {
     thread_data_t *data = (thread_data_t *)arg;
+
+    // Use high precision rendering if needed
+    if (data->use_high_precision) {
+        render_high_precision(data);
+        return NULL;
+    }
 
     double aspect = (double)data->height / data->width;
     double x_min = data->cx - data->scale / 2;
@@ -281,6 +356,25 @@ static void render_mandelbrot(Uint32 *pixels, int width, int height,
     if (num_threads < 1) num_threads = 4;
     if (num_threads > height) num_threads = height;
 
+    // Detect if we need high precision rendering
+    int use_high_precision = (scale < PRECISION_THRESHOLD);
+    static int precision_notified = 0;
+
+    if (use_high_precision && !precision_notified) {
+        printf("\n=== HIGH PRECISION MODE ===\n");
+        printf("Scale %.2e < %.2e threshold\n", scale, PRECISION_THRESHOLD);
+        printf("Switching to long double (80-bit) precision\n");
+        printf("SIMD disabled, using scalar rendering\n");
+        printf("Note: ~1000x deeper zoom available\n");
+        printf("===========================\n\n");
+        precision_notified = 1;
+    } else if (!use_high_precision && precision_notified) {
+        printf("\n=== NORMAL PRECISION MODE ===\n");
+        printf("SIMD enabled (AVX-512/AVX2)\n");
+        printf("==============================\n\n");
+        precision_notified = 0;
+    }
+
     pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
     thread_data_t *thread_data = malloc(num_threads * sizeof(thread_data_t));
 
@@ -301,6 +395,7 @@ static void render_mandelbrot(Uint32 *pixels, int width, int height,
         thread_data[t].scale = scale;
         thread_data[t].max_iter = max_iter;
         thread_data[t].pixels = pixels;
+        thread_data[t].use_high_precision = use_high_precision;
 
         pthread_create(&threads[t], NULL, render_thread, &thread_data[t]);
 
